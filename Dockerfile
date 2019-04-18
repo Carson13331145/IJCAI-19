@@ -60,4 +60,4 @@ RUN conda install pytorch torchvision cudatoolkit=8.0 -c pytorch && \
 ADD . /competition
 
 WORKDIR /competition
-RUN pip --no-cache-dir install  -r requirements.txt
+RUN conda install --yes --file requirements.txt
