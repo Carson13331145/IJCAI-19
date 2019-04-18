@@ -1,85 +1,113 @@
-"""
-Implementation of example defense.
-This defense loads inception v1 checkpoint and classifies all images using loaded checkpoint.
-"""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import os
+import sys
+import PIL
+import glob
+import argparse
 import numpy as np
-from scipy.misc import imread
-from scipy.misc import imresize
-import tensorflow as tf
-from tensorflow.contrib.slim.nets import inception
-slim = tf.contrib.slim
+import pandas as pd
+from PIL import Image
+from PIL import ImageFile
+import torch
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from progressbar import *
+from densenet import densenet121, densenet161
 
-tf.flags.DEFINE_string(
-    'checkpoint_path', '', 'Path to checkpoint for inception network.')
-tf.flags.DEFINE_string(
-    'input_dir', '', 'Input directory with images.')
-tf.flags.DEFINE_string(
-    'output_file', '', 'Output file to save labels.')
-tf.flags.DEFINE_integer(
-    'image_width', 224, 'Width of each input images.')
-tf.flags.DEFINE_integer(
-    'image_height', 224, 'Height of each input images.')
-tf.flags.DEFINE_integer(
-    'batch_size', 16, 'Batch size to processing images')
-tf.flags.DEFINE_integer(
-    'num_classes', 110, 'How many classes of the data set')
-FLAGS = tf.flags.FLAGS
+model_class_map = {
+    'densenet121': densenet121,
+    'densenet161': densenet161
+}
 
-def load_images(input_dir, batch_shape):
-    images = np.zeros(batch_shape)
-    filenames = []
-    idx = 0
-    batch_size = batch_shape[0]
-    for filepath in tf.gfile.Glob(os.path.join(input_dir, '*.png')):
-        with open(filepath) as f:
-            raw_image = imread(f, mode='RGB')
-            image = imresize(raw_image, [FLAGS.image_height, FLAGS.image_width]).astype(np.float)
-            image = (image / 255.0) * 2.0 - 1.0
-        images[idx, :, :, :] = image
-        filenames.append(os.path.basename(filepath))
-        idx += 1
-        if idx == batch_size:
-            yield filenames, images
-            filenames = []
-            images = np.zeros(batch_shape)
-            idx = 0
-    if idx > 0:
-        yield filenames, images
+class ImageSet(Dataset):
+    def __init__(self, df, transformer):
+        self.df = df
+        self.transformer = transformer
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, item):
+        image_path = self.df.iloc[item]['image_path']
+        image = self.transformer(Image.open(image_path))#.convert('RGB'))
+        label_idx = self.df.iloc[item]['label_idx']
+        sample = {
+            'dataset_idx': item,
+            'image': image,
+            'label_idx': label_idx,
+            'filename':os.path.basename(image_path)
+        }
+        return sample
+
+def load_data_for_defense(input_dir, img_size, batch_size=8):
+
+    all_img_paths = glob.glob(os.path.join(input_dir, '*.png'))
+    all_labels = [-1 for i in range(len(all_img_paths))]
+    dev_data = pd.DataFrame({'image_path':all_img_paths, 'label_idx':all_labels})
+
+    transformer = transforms.Compose([
+        transforms.Resize([img_size, img_size], interpolation=PIL.Image.BILINEAR),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5],
+                             std=[0.5, 0.5, 0.5]),
+    ])
+    datasets = {
+        'dev_data': ImageSet(dev_data, transformer)
+    }
+    dataloaders = {
+        ds: DataLoader(datasets[ds],
+                       batch_size=batch_size,
+                       num_workers=0,
+                       shuffle=False) for ds in datasets.keys()
+    }
+    return dataloaders
+
+def defense(input_dir, target_model, weights_path, output_file, batch_size):
+    # Define CNN model
+    Model = model_class_map[target_model]
+    # defense_fn = defense_method_map[defense_type]
+    model = Model(num_classes=110)
+    # Loading data for ...
+    print('loading data for defense using %s ....' %target_model)
+    img_size = model.input_size[0]
+    loaders = load_data_for_defense(input_dir, img_size, batch_size)
+
+    # Prepare predict options
+    device = torch.device('cuda:0')
+    model = model.to(device)
+#    model = torch.nn.DataParallel(model)
+    pth_file = glob.glob(os.path.join(weights_path, 'densenet121.pth'))[0]
+    print('loading weights from : ', pth_file)
+    model.load_state_dict(torch.load(pth_file))
+
+    # for store result
+    result = {'filename':[], 'predict_label':[]}
+    # Begin predicting
+    model.eval()
+    widgets = ['dev_data :',Percentage(), ' ', Bar('#'),' ', Timer(),
+       ' ', ETA(), ' ', FileTransferSpeed()]
+    pbar = ProgressBar(widgets=widgets)
+    for batch_data in pbar(loaders['dev_data']):
+        image = batch_data['image'].to(device)
+        filename = batch_data['filename']
+        with torch.no_grad():
+            logits = model(image)
+        y_pred = logits.max(1)[1].detach().cpu().numpy().tolist()
+        result['filename'].extend(filename)
+        result['predict_label'].extend(y_pred)
+    print('write result file to : ', output_file)
+    pd.DataFrame(result).to_csv(output_file, header=False, index=False)
 
 
-def main(_):
-    batch_shape = [FLAGS.batch_size, FLAGS.image_height, FLAGS.image_width, 3]
-    nb_classes = FLAGS.num_classes
+def main(argv):
+    target_model = 'densenet121'
+    weights_path = 'model'
+    input_dir = argv[1]
+    output_file = argv[2]
+    batch_size = 8
+    defense(input_dir, target_model, weights_path, output_file, batch_size)
 
-    tf.logging.set_verbosity(tf.logging.INFO)
-
-    with tf.Graph().as_default():
-        # Prepare graph
-        x_input = tf.placeholder(tf.float32, shape=batch_shape)
-
-        with slim.arg_scope(inception.inception_v1_arg_scope()):
-            _, end_points = inception.inception_v1(
-                x_input, num_classes=nb_classes, is_training=False)
-        predicted_labels = tf.argmax(end_points['Predictions'], 1)
-
-        # Restore Model
-        saver = tf.train.Saver(slim.get_model_variables())
-        session_creator = tf.train.ChiefSessionCreator(
-            scaffold=tf.train.Scaffold(saver=saver),
-            checkpoint_filename_with_path=FLAGS.checkpoint_path)
-        # Run computation
-        with tf.train.MonitoredSession(session_creator=session_creator) as sess:
-            with open(FLAGS.output_file, 'w') as out_file:
-                for filenames, images in load_images(FLAGS.input_dir, batch_shape):
-                    labels = sess.run(predicted_labels, feed_dict={x_input: images})
-                    for filename, label in zip(filenames, labels):
-                        out_file.write('{0},{1}\n'.format(filename, label))
-
-
-if __name__ == '__main__':
-    tf.app.run()
+if __name__=='__main__':
+    main(sys.argv)

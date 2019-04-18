@@ -13,5 +13,4 @@ OUTPUT_FILE=$2
 
 python defense.py \
   --input_dir="${INPUT_DIR}" \
-  --output_file="${OUTPUT_FILE}" \
-  --checkpoint_path=./models/inception_v1/inception_v1.ckpt
+  --output_file="${OUTPUT_FILE}"
